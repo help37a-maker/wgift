@@ -1,17 +1,177 @@
-const express = require("express");
-const path = require("path");
+import 'dotenv/config';
+import express from 'express';
+import axios from 'axios';
+import { Telegraf, Markup } from 'telegraf';
+import crypto from 'crypto';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const { BOT_TOKEN, PUBLIC_URL, PORT = 3000 } = process.env;
+if (!BOT_TOKEN || !PUBLIC_URL) {
+  console.error('Set BOT_TOKEN and PUBLIC_URL in .env');
+  process.exit(1);
+}
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// Раздаём статические файлы из папки webapp
-app.use("/webapp", express.static(path.join(__dirname, "webapp")));
+// --- Telegraf bot ---
+const bot = new Telegraf(BOT_TOKEN);
 
-// Главная страница
-app.get("/", (req, res) => {
-  res.send("✅ Бот работает! Зайди в /webapp чтобы открыть мини-приложение.");
+// Кнопка для запуска Mini App
+bot.start((ctx) => {
+  return ctx.reply(
+    'Добро пожаловать в магазин подарков!',
+    Markup.inlineKeyboard([
+      Markup.button.webApp('Запустить магазин', `${PUBLIC_URL}/webapp/`)
+    ])
+  );
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Сервер запущен на порту ${PORT}`);
+// Успешная оплата -> выдаём подарок
+bot.on('message', async (ctx) => {
+  const msg = ctx.message;
+  if (msg.successful_payment) {
+    // Получаем вашу внутреннюю запись заказа по payload (invoice_payload)
+    const payload = msg.successful_payment.invoice_payload; // ваш orderId
+    const userId = msg.from.id;
+
+    try {
+      // Здесь должна быть ваша БД; для примера — in-memory map
+      const order = orders.get(payload);
+      if (!order  order.status !== 'pending'  order.userId !== userId) return;
+
+      // Отправляем официальный подарок пользователю (Bot API 8.0+).
+      // NB: точные поля для sendGift могут отличаться в вашей SDK.
+      // При необходимости вызывайте Bot API напрямую:
+      // POST https://api.telegram.org/bot<BOT_TOKEN>/sendGift
+      await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendGift`, {
+        user_id: userId,
+        gift_id: order.giftId
+      });
+
+      order.status = 'delivered';
+      await ctx.reply('Подарок отправлен! Спасибо за покупку ✨');
+    } catch (e) {
+      console.error('sendGift failed', e?.response?.data || e.message);
+      await ctx.reply('Оплата прошла, но выдача подарка не удалась. Напишите в поддержку: /paysupport');
+    }
+  }
 });
+
+// (необязательно) webhook
+// await bot.telegram.setWebhook(`${PUBLIC_URL}/bot${bot.secretPathComponent()}`);
+// app.use(bot.webhookCallback(`/bot${bot.secretPathComponent()}`));
+
+// Для простоты — long polling в dev:
+bot.launch().then(() => console.log('Bot started (long polling)'));
+
+// --- Псевдо-БД заказов (для примера) ---
+const orders = new Map(); // key: orderId -> { userId, giftId, title, priceStars, status }
+
+// --- Валидация initData от Mini App (HMAC-SHA256) ---
+function validateInitData(initData, botToken) {
+  // initData – это строка query, пришедшая из Telegram.WebApp.initData
+  const urlParams = new URLSearchParams(initData);
+  const hash = urlParams.get('hash');
+  urlParams.delete('hash');
+
+  // Формируем data_check_string
+  const dataCheckArr = [];
+  for (const [key, value] of urlParams.entries()) dataCheckArr.push(`${key}=${value}`);
+  dataCheckArr.sort();
+  const dataCheckString = dataCheckArr.join('\n');
+
+  // Секретный ключ = SHA256(botToken)
+  const secretKey = crypto.createHash('sha256').update(botToken).digest();
+
+  // HMAC_SHA256(data_check_string, secretKey)
+  const hmac = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
+
+  return hmac === hash;
+}
+
+// --- API: получить список подарков ---
+app.get('/api/gifts', async (req, res) => {
+  try {
+    // Пытаемся получить официальный каталог подарков (Bot API 8.0+)
+    // POST getAvailableGifts
+    const { data } = await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/getAvailableGifts`, {});
+    if (data.ok) {
+      // Преобразуем под фронт
+      const gifts = data.result.map(g => ({
+        id: g.id,
+        title: g.title  g.emoji  'Gift',
+        // предполагаемые поля; используйте те, что вернёт ваш бот:
+        priceStars: g.star_count  g.price_stars  100,
+        photo: g.photo_url || null
+      }));
+      return res.json({ gifts });
+    }
+    throw new Error(JSON.stringify(data));
+  } catch (e) {
+    // Фоллбэк: статический набор
+    return res.json({
+      gifts: [
+        { id: 'g1', title: '🎁 Classic Gift', priceStars: 100 },
+
+дима, [19.08.2025 18:59]
+{ id: 'g2', title: '💫 Super Gift',  priceStars: 300 },
+        { id: 'g3', title: '🔥 Mega Gift',   priceStars: 700 }
+      ]
+    });
+  }
+});
+
+// --- API: создать инвойс в Stars для конкретного подарка ---
+app.post('/api/create-invoice', async (req, res) => {
+  try {
+    const { initData, giftId, title, priceStars } = req.body;
+
+    if (!validateInitData(initData, BOT_TOKEN)) {
+      return res.status(403).json({ error: 'Bad initData' });
+    }
+
+    // На основе initData можно получить user.id (разберите JSON в initData)
+    const user = JSON.parse(decodeURIComponent(new URLSearchParams(initData).get('user') || '{}'));
+    const userId = user?.id;
+    if (!userId) return res.status(400).json({ error: 'No user in initData' });
+
+    // Создаём заказ
+    const orderId = order_${Date.now()}_${Math.random().toString(36).slice(2)};
+    orders.set(orderId, {
+      userId,
+      giftId,
+      title,
+      priceStars,
+      status: 'pending'
+    });
+
+    // Создаём ссылку на инвойс (XTR — валюта Stars)
+    const { data } = await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/createInvoiceLink`, {
+      title: title || 'Gift',
+      description: Покупка: ${title},
+      payload: orderId,                 // попадёт в successful_payment.invoice_payload
+      provider_token: '',               // для Stars не требуется
+      currency: 'XTR',
+      prices: [{ label: title, amount: Number(priceStars) }] // amount = кол-во звёзд
+    });
+
+    if (!data.ok) throw new Error(JSON.stringify(data));
+    return res.json({ invoiceLink: data.result });
+  } catch (e) {
+    console.error('create-invoice failed', e?.response?.data || e.message);
+    res.status(500).json({ error: 'Failed to create invoice' });
+  }
+});
+
+// --- Статика Mini App ---
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+app.use('/webapp', express.static(path.join(__dirname, 'public', 'webapp')));
+
+// --- Тех страницы ---
+app.get('/terms', (req, res) => res.send('Условия использования: цифровые товары, возвраты по правилам Telegram Stars.'));
+app.get('/paysupport', (req, res) => res.send('Поддержка: напишите @your_support или email support@example.com'));
+
+app.listen(PORT, () => console.log(`HTTP on http://localhost:${PORT}`));
